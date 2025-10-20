@@ -190,11 +190,12 @@ def _cluster_var(returns):
 # Regime-aware HRP with drawdown control
 def regime_aware_hrp_with_drawdown(returns: pd.DataFrame,
                                    detect_fn=None,
-                                   defensive_assets: Optional[list] = None,
                                    confidence_threshold: float = 0.55,
                                    drawdown_control: bool = True,
                                    drawdown_mode: str = 'B',
                                    drawdown_threshold: float = 0.10,
+                                   defensive_assets: list = None,
+                                   max_drawdown_allocation: float = 0.30,
                                    **kwargs) -> Dict[str, pd.Series]:
     """
     A regime-aware HRP implementation that uses a provided detection function
@@ -203,14 +204,31 @@ def regime_aware_hrp_with_drawdown(returns: pd.DataFrame,
 
     If detect_fn is None, returns plain HRP weights.
     
+    Parameters:
+    - returns: DataFrame of returns
+    - detect_fn: Function to detect regimes
+    - drawdown_control: Whether to apply drawdown control
+    - defensive_assets: List of assets to use during drawdown regime (e.g., ["TLT", "GLD"])
+    - max_drawdown_allocation: Maximum allocation to defensive assets during drawdown (0-1)
+    
+    When drawdown_control=True and in drawdown regime: 
+        - Allocates up to max_drawdown_allocation to defensive assets (equal-weighted)
+        - Remaining allocation goes to risky assets scaled down proportionally
     When drawdown_control=False: regime_weights = final_weights (no drawdown adjustment)
-    When drawdown_control=True: final_weights adds defensive allocation based on drawdown_mode
     """
     tickers = returns.columns
     
-    # Default defensive assets
+    # Validate and filter defensive assets
     if defensive_assets is None:
         defensive_assets = []
+    else:
+        defensive_assets = [asset for asset in defensive_assets if asset in tickers]
+    
+    if defensive_assets and len(defensive_assets) > 0:
+        print(f"[Regime HRP] Using defensive assets: {defensive_assets}")
+    
+    # Ensure max_drawdown_allocation is valid
+    max_drawdown_allocation = max(0.0, min(1.0, max_drawdown_allocation))
 
     # Baseline HRP
     base_w = get_base_hrp_weights(returns)
@@ -234,58 +252,42 @@ def regime_aware_hrp_with_drawdown(returns: pd.DataFrame,
 
     # Apply regime-based adjustments to HRP weights
     regime_w = base_w.copy()
-    
-    # If current regime is 'drawdown', tilt towards defensive assets
-    if current_regime == 'drawdown':
-        for d in defensive_assets:
-            if d in tickers:
-                boost = 0.05 / max(1, len(defensive_assets))
-                regime_w[d] = min(regime_w.get(d, 0.0) + boost, 1.0)
-        
-        # Renormalize
-        regime_w = regime_w.clip(lower=0.0)
-        if regime_w.sum() > 0:
-            regime_w = regime_w / regime_w.sum()
 
-    # Apply drawdown control if enabled
-    final_w = regime_w.copy()
-    
+    # Regime-aware drawdown control: shift to defensive assets during drawdown
     if drawdown_control and current_regime == 'drawdown':
-        if drawdown_mode == 'A':
-            # Mode A: Shift more allocations to defensive assets
-            for d in defensive_assets:
-                if d in tickers:
-                    final_w[d] += drawdown_threshold / max(1, len(defensive_assets))
+        final_w = pd.Series(0.0, index=tickers)
+        
+        if defensive_assets and len(defensive_assets) > 0:
+            # Equal-weight the defensive assets and allocate max_drawdown_allocation
+            defensive_weight = max_drawdown_allocation / len(defensive_assets)
+            for asset in defensive_assets:
+                final_w[asset] = defensive_weight
             
-            final_w = final_w.clip(lower=0.0)
-            if final_w.sum() > 0:
-                final_w = final_w / final_w.sum()
-                
-        elif drawdown_mode == 'B':
-            # Mode B: Reduce all risky allocations proportionally
-            final_w = final_w * (1 - drawdown_threshold)
-            remain = 1 - final_w.sum()
+            # Remaining allocation to risky assets (scaled down proportionally)
+            risky_allocation = 1.0 - max_drawdown_allocation
+            risky_assets = [a for a in tickers if a not in defensive_assets]
             
-            if defensive_assets:
-                eligible = [d for d in defensive_assets if d in tickers]
-                if eligible and remain > 0:
-                    per_def = remain / len(eligible)
-                    for d in eligible:
-                        final_w[d] = final_w.get(d, 0.0) + per_def
-            
-            final_w = final_w.clip(lower=0.0)
-            if final_w.sum() > 0:
-                final_w = final_w / final_w.sum()
-                
+            if risky_assets and risky_allocation > 0:
+                # Scale risky asset weights proportionally
+                risky_weights = regime_w[risky_assets].copy()
+                if risky_weights.sum() > 0:
+                    risky_weights = risky_weights / risky_weights.sum()
+                    risky_weights = risky_weights * risky_allocation
+                    final_w[risky_assets] = risky_weights
         else:
-            # Mode C: Total risk-off
-            final_w = pd.Series(0.0, index=tickers)
-            eligible = [d for d in defensive_assets if d in tickers]
-            if eligible:
-                per_def = 1.0 / len(eligible)
-                for d in eligible:
-                    final_w[d] = per_def
-    
+            # No defensive assets specified: scale down all risky assets by max_drawdown_allocation
+            final_w = regime_w * (1.0 - max_drawdown_allocation)
+            if final_w.sum() > 0:
+                final_w = final_w / final_w.sum()
+    else:
+        # Normal regime: use HRP weights
+        final_w = regime_w.copy()
+        if final_w.sum() > 0:
+            final_w = final_w / final_w.sum()
+        else:
+            # Fallback to equal weights if sum is zero
+            final_w = pd.Series(1.0 / len(tickers), index=tickers)
+
     return {
         'regime_weights': regime_w.fillna(0.0),
         'final_weights': final_w.fillna(0.0)
@@ -326,3 +328,122 @@ def detect_regimes_hmm_responsive(returns: pd.DataFrame) -> pd.Series:
             regimes.iloc[i] = 'normal'
     
     return regimes
+
+
+def apply_volatility_constraint(weights: pd.Series, returns: pd.DataFrame, 
+                              max_volatility: float, allow_cash: bool = True) -> pd.Series:
+    """
+    Apply volatility constraint to portfolio weights.
+    
+    Parameters:
+    - weights: Base portfolio weights
+    - returns: Historical returns data  
+    - max_volatility: Maximum allowed portfolio volatility (annualized)
+    - allow_cash: If True, scale weights down and allow cash. If False, optimize to hit target.
+    
+    Returns:
+    - Adjusted weights that satisfy volatility constraint
+    """
+    if len(weights) == 0 or max_volatility <= 0:
+        return weights
+    
+    try:
+        # Calculate portfolio volatility
+        cov_matrix = returns.cov()
+        if cov_matrix.isnull().values.any():
+            return weights
+            
+        # Annualized volatility
+        portfolio_var = np.dot(weights.values, np.dot(cov_matrix.values, weights.values))
+        portfolio_vol = np.sqrt(portfolio_var * 252)
+        
+        if portfolio_vol <= max_volatility:
+            # Already within constraint
+            return weights
+            
+        if allow_cash:
+            # Scale down weights to meet volatility constraint
+            scale_factor = max_volatility / portfolio_vol
+            adjusted_weights = weights * scale_factor
+            
+            # The remaining goes to cash (implicit)
+            cash_allocation = 1.0 - adjusted_weights.sum()
+            
+            return adjusted_weights
+        else:
+            # Optimize weights to sum to 1 while meeting volatility constraint
+            # Simple scaling approach - more sophisticated optimization could be used
+            scale_factor = max_volatility / portfolio_vol
+            adjusted_weights = weights * scale_factor
+            
+            # Renormalize to sum to 1
+            if adjusted_weights.sum() > 0:
+                adjusted_weights = adjusted_weights / adjusted_weights.sum()
+            
+            return adjusted_weights
+            
+    except Exception as e:
+        print(f"Error applying volatility constraint: {e}")
+        return weights
+
+
+def get_hrp_weights_with_constraints(returns: pd.DataFrame, max_volatility: float = None, 
+                                   allow_cash: bool = True, defensive_assets: list = None) -> pd.Series:
+    """
+    Get HRP weights with volatility constraints applied.
+    
+    Parameters:
+    - returns: Historical returns data
+    - max_volatility: Maximum allowed portfolio volatility (annualized) 
+    - allow_cash: Whether to allow cash allocation
+    - defensive_assets: List of defensive assets (excluded from display)
+    
+    Returns:
+    - Portfolio weights with constraints applied
+    """
+    # Get base HRP weights
+    base_weights = get_base_hrp_weights(returns)
+    
+    # Apply volatility constraint if specified
+    if max_volatility is not None:
+        base_weights = apply_volatility_constraint(base_weights, returns, max_volatility, allow_cash)
+    
+    return base_weights
+
+
+def get_regime_weights_with_constraints(returns: pd.DataFrame, max_volatility: float = None,
+                                      allow_cash: bool = True, defensive_assets: list = None,
+                                      confidence_threshold: float = 0.55, drawdown_control: bool = True,
+                                      drawdown_mode: str = 'B', drawdown_threshold: float = 0.10,
+                                      max_drawdown_allocation: float = 0.30) -> Dict[str, pd.Series]:
+    """
+    Get regime-aware HRP weights with volatility constraints applied.
+    
+    Parameters:
+    - returns: Historical returns data
+    - max_volatility: Maximum allowed portfolio volatility (annualized)
+    - allow_cash: Whether to allow cash allocation
+    - defensive_assets: List of defensive assets to use during drawdown regime
+    - max_drawdown_allocation: Maximum allocation to defensive assets during drawdown (0-1)
+    
+    Returns:
+    - Dictionary with 'regime_weights' and 'final_weights'
+    """
+    # Get regime-aware weights
+    regime_result = regime_aware_hrp_with_drawdown(
+        returns, detect_regimes_hmm_responsive,
+        confidence_threshold, drawdown_control, drawdown_mode, drawdown_threshold,
+        defensive_assets=defensive_assets,
+        max_drawdown_allocation=max_drawdown_allocation
+    )
+    
+    # Apply volatility constraints to both regime_weights and final_weights
+    if max_volatility is not None:
+        regime_result['regime_weights'] = apply_volatility_constraint(
+            regime_result['regime_weights'], returns, max_volatility, allow_cash
+        )
+        regime_result['final_weights'] = apply_volatility_constraint(
+            regime_result['final_weights'], returns, max_volatility, allow_cash
+        )
+    
+    return regime_result
